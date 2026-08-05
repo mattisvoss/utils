@@ -1,0 +1,499 @@
+# ============================================================================
+# cohort_check.R
+# The cattle cohort check for the monthly Livestock Slaughterings release.
+# ============================================================================
+#
+# THE IDEA IN PLAIN ENGLISH
+# -------------------------
+# Cattle slaughtered this month were born roughly 1 to 3 years ago. So this
+# month's kill of prime cattle (steers + heifers + bulls) should track the
+# calf crop of 12-36 months ago -- once we remove the calves that left the
+# cohort early, either exported live or slaughtered here as calves.
+#
+# We compute the RATIO:
+#
+#     ratio = (prime cattle killed, last 12 months)
+#             -------------------------------------
+#             (calves available to kill, last 12 months)
+#
+# We never care what the ratio IS (about 0.6 -- mortality, heifers kept for
+# breeding etc. are all bundled into it). We only care that it is STABLE.
+# A stable ratio means a fall in the kill is a real market movement.
+# A ratio that jumps outside its normal range means: investigate before
+# publishing (missing plant? unit error? pipeline bug?).
+#
+# HOW TO USE
+# ----------
+# You only ever need to call ONE function:
+#
+#     out <- run_cohort_check(births, exports, kill)
+#     out$latest_check    # one-row Pass/FLAG table for the sign-off note
+#     out$plot_tracking   # chart 1: kill vs lagged calf supply
+#     out$plot_ratio      # chart 2: the ratio with its normal-range band
+#
+# See example_run.R for a complete worked example with fake data,
+# and README.md for the exact column layout your three input tables need.
+#
+# The #' comments below are roxygen-style documentation: they read as plain
+# notes here, and become real help pages if this ever moves into a package.
+# ============================================================================
+
+library(dplyr)      # data manipulation verbs: mutate, filter, join, ...
+library(tidyr)      # crossing(), unnest()
+library(purrr)      # map2() for building lists inside a data frame
+library(lubridate)  # calendar arithmetic: month %m-% months(3)
+library(slider)     # rolling windows: slide_dbl()
+library(plotly)     # interactive charts
+
+
+# ----------------------------------------------------------------------------
+# 0. The age bands used in the live-export data
+# ----------------------------------------------------------------------------
+
+#' Default age bands for the live-export data
+#'
+#' Each band says: "an animal exported in this band was between a_min and
+#' a_max months old (a_max not included)". Edit this table if your export
+#' file uses different band labels -- the labels must match exactly.
+#' The "30+" band is assumed to mean 30-36 months.
+#'
+#' @return A data frame with columns age_band, a_min, a_max.
+default_band_limits <- function() {
+  tribble(
+    ~age_band, ~a_min, ~a_max,
+    "0-3",         0L,     3L,
+    "3-6",         3L,     6L,
+    "6-12",        6L,    12L,
+    "12-18",      12L,    18L,
+    "18-24",      18L,    24L,
+    "24-30",      24L,    30L,
+    "30+",        30L,    36L
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# 1. Input checking -- fail early with a friendly message
+# ----------------------------------------------------------------------------
+
+#' Check the three input tables before doing any maths
+#'
+#' Verifies that each table has the right columns, that `month` is a Date,
+#' that there are no missing months in the sequence, and that every age band
+#' in the exports table is one we know how to handle. Stops with a plain
+#' English error if anything is wrong. Returns nothing (invisibly) if all OK.
+#'
+#' @param births  Data frame: month (Date), births (number of calves born).
+#' @param exports Data frame: month (Date), age_band (text), n (head exported).
+#' @param kill    Data frame: month (Date), steers, heifers, bulls, cows,
+#'                calves (heads slaughtered).
+#' @param band_limits Age-band definitions, see default_band_limits().
+check_inputs <- function(births, exports, kill,
+                         band_limits = default_band_limits()) {
+
+  need_cols <- function(df, cols, name) {
+    missing <- setdiff(cols, names(df))
+    if (length(missing) > 0) {
+      stop("The `", name, "` table is missing column(s): ",
+           paste(missing, collapse = ", "), call. = FALSE)
+    }
+    if (!inherits(df$month, "Date")) {
+      stop("The `month` column of `", name, "` must be a Date ",
+           "(the first day of each month), e.g. as.Date(\"2024-01-01\").",
+           call. = FALSE)
+    }
+  }
+
+  need_cols(births,  c("month", "births"), "births")
+  need_cols(exports, c("month", "age_band", "n"), "exports")
+  need_cols(kill,    c("month", "steers", "heifers", "bulls",
+                       "cows", "calves"), "kill")
+
+  # every export band must be defined, otherwise animals would silently vanish
+  unknown <- setdiff(unique(exports$age_band), band_limits$age_band)
+  if (length(unknown) > 0) {
+    stop("The exports table contains age band(s) I don't recognise: ",
+         paste(unknown, collapse = ", "),
+         ". Add them to the band_limits table (see default_band_limits()).",
+         call. = FALSE)
+  }
+
+  # months must form an unbroken sequence -- a gap would corrupt the
+  # rolling-window calculations without any visible error
+  check_no_gaps <- function(df, name) {
+    m <- sort(unique(df$month))
+    full <- seq(min(m), max(m), by = "month")
+    if (length(m) != length(full) || !all(m == full)) {
+      stop("The `", name, "` table has missing month(s) in its sequence. ",
+           "Every month between ", min(m), " and ", max(m),
+           " must be present.", call. = FALSE)
+    }
+  }
+  check_no_gaps(births,  "births")
+  check_no_gaps(exports, "exports")
+  check_no_gaps(kill,    "kill")
+
+  invisible(NULL)
+}
+
+
+# ----------------------------------------------------------------------------
+# 2. Allocate removals (exports, calf kill) back to birth cohorts
+# ----------------------------------------------------------------------------
+
+#' Spread exported animals back over their possible birth months
+#'
+#' An animal exported in month m, in age band 3-6 months, was born somewhere
+#' in the 3 months from (m - 6 months, exclusive) to (m - 3 months). We don't
+#' know which, so we spread the count evenly across the candidate months.
+#' The spreading error is tiny and is flattened by the 12-month rolling
+#' window used later.
+#'
+#' Animal numbers are conserved: the total allocated always equals the total
+#' exported (there is a testthat test for exactly this).
+#'
+#' @param exports Data frame: month, age_band, n.
+#' @param band_limits Age-band definitions.
+#' @return Data frame: birth_month, removed.
+allocate_exports_to_cohorts <- function(exports,
+                                        band_limits = default_band_limits()) {
+  exports |>
+    inner_join(band_limits, by = "age_band") |>
+    # one row per possible age-in-months, e.g. band 3-6 -> ages 3, 4, 5
+    mutate(age_in_months = map2(a_min, a_max, ~ seq(.x, .y - 1L))) |>
+    unnest(age_in_months) |>
+    mutate(
+      birth_month = month %m-% months(age_in_months),
+      # split the band's count evenly over its possible birth months
+      n_allocated = n / (a_max - a_min)
+    ) |>
+    count(birth_month, wt = n_allocated, name = "removed")
+}
+
+
+#' Net calf crop: calves born, minus those that left the cohort early
+#'
+#' "Left early" means exported live (any age) or slaughtered here as a calf.
+#' Domestic calf slaughterings are assigned to the birth cohort of one month
+#' earlier -- calves are killed very young, so this is close enough.
+#'
+#' @return The births table plus columns `removed` and `ncc`
+#'   (ncc = births - removed).
+net_calf_crop <- function(births, exports, kill,
+                          band_limits = default_band_limits()) {
+
+  export_removals <- allocate_exports_to_cohorts(exports, band_limits)
+
+  calf_removals <- kill |>
+    transmute(birth_month = month %m-% months(1), removed = calves)
+
+  removals <- bind_rows(export_removals, calf_removals) |>
+    count(birth_month, wt = removed, name = "removed")
+
+  births |>
+    left_join(removals, by = c("month" = "birth_month")) |>
+    mutate(
+      removed = coalesce(removed, 0),
+      ncc     = births - removed
+    ) |>
+    arrange(month)
+}
+
+
+# ----------------------------------------------------------------------------
+# 3. The check itself
+# ----------------------------------------------------------------------------
+
+#' Run the full cohort calculation
+#'
+#' Steps, in order:
+#'   1. Net calf crop per birth month (births minus early leavers).
+#'   2. "Supply" for month t = average net calf crop of the cohorts now at
+#'      slaughter age, i.e. those born 12 to 36 months before t.
+#'   3. 12-month rolling sums of both the prime kill and the supply.
+#'      (Why 12? Both series have strong annual seasonality -- spring calving,
+#'      autumn kill -- and a 12-month window cancels annual patterns exactly.)
+#'   4. ratio = rolling kill / rolling supply.
+#'
+#' @param births,exports,kill See check_inputs() for the required columns.
+#' @param band_limits Age-band definitions.
+#' @param lag_min,lag_max Youngest and oldest slaughter age in months.
+#'   Defaults 12-36 cover young bulls (youngest) to late steers (oldest).
+#' @return A data frame with one row per kill month and columns:
+#'   month, prime_kill, ncc, supply, kill_12m, supply_12m, ratio,
+#'   kill_index, supply_index (both indexed to 100 at the first usable month).
+cohort_check <- function(births, exports, kill,
+                         band_limits = default_band_limits(),
+                         lag_min = 12, lag_max = 36) {
+
+  check_inputs(births, exports, kill, band_limits)
+
+  ncc <- net_calf_crop(births, exports, kill, band_limits)
+
+  # Supply must be computed on the FULL births series (which starts years
+  # before the kill series), and only afterwards joined onto the kill months.
+  supply_tbl <- ncc |>
+    arrange(month) |>
+    mutate(
+      # lag(ncc, 12) shifts the series 12 months back; a window of the
+      # previous 24 values of the shifted series then covers lags 12..36.
+      supply = slide_dbl(lag(ncc, lag_min), mean,
+                         .before = lag_max - lag_min, .complete = TRUE)
+    ) |>
+    select(month, ncc, supply)
+
+  results <- kill |>
+    transmute(month, prime_kill = steers + heifers + bulls) |>
+    left_join(supply_tbl, by = "month") |>
+    arrange(month) |>
+    mutate(
+      kill_12m   = slide_dbl(prime_kill, sum, .before = 11, .complete = TRUE),
+      supply_12m = slide_dbl(supply,     sum, .before = 11, .complete = TRUE),
+      ratio      = kill_12m / supply_12m
+    )
+
+  first_ok <- which(!is.na(results$ratio))[1]
+  if (is.na(first_ok)) {
+    stop("Not enough history to compute the ratio. You need births data ",
+         "starting at least ", lag_max, " months before the first kill ",
+         "month, plus 12 further months of kill data.", call. = FALSE)
+  }
+
+  results |>
+    mutate(
+      kill_index   = 100 * kill_12m   / kill_12m[first_ok],
+      supply_index = 100 * supply_12m / supply_12m[first_ok]
+    )
+}
+
+
+#' The "normal range" of the ratio
+#'
+#' Mean and standard deviation of the ratio over a reference period that
+#' EXCLUDES the most recent 12 months (so this month's possible error cannot
+#' contaminate its own yardstick). The band is mean +/- 2 standard deviations.
+#'
+#' A floor of 0.1% of the mean is applied to the standard deviation, so that
+#' near-perfectly-stable history doesn't produce absurdly tight bands that
+#' flag meaningless movements.
+#'
+#' @param results Output of cohort_check().
+#' @param n_exclude How many recent months to leave out of the reference.
+#' @return A list: mean, sigma, lower, upper.
+ratio_bands <- function(results, n_exclude = 12) {
+  ok <- filter(results, !is.na(ratio))
+  ref <- filter(ok, month <= max(ok$month) %m-% months(n_exclude))
+  if (nrow(ref) < 12) {
+    stop("Need at least 24 months of ratio history (12 reference + 12 ",
+         "excluded) before the bands are meaningful.", call. = FALSE)
+  }
+  mu  <- mean(ref$ratio)
+  sig <- max(sd(ref$ratio), 0.001 * mu)   # the 0.1% floor
+  list(mean = mu, sigma = sig, lower = mu - 2 * sig, upper = mu + 2 * sig)
+}
+
+
+#' Pass/FLAG verdict for the latest month (check L3.2 in the sign-off note)
+#'
+#' FLAG if either:
+#'   (a) the latest ratio is outside the mean +/- 2 sigma band, or
+#'   (b) the ratio jumped by more than 2 sigma in a single month.
+#' A FLAG is not an error -- it is an instruction to investigate and explain
+#' before publishing.
+#'
+#' @param results Output of cohort_check().
+#' @return A one-row data frame ready to paste into the sign-off note.
+flag_latest_month <- function(results) {
+  b  <- ratio_bands(results)
+  ok <- filter(results, !is.na(ratio))
+
+  current <- ok$ratio[nrow(ok)]
+  previous <- ok$ratio[nrow(ok) - 1]
+  jump <- abs(current - previous)
+
+  outside_band <- current < b$lower | current > b$upper
+  big_jump     <- jump > 2 * b$sigma
+
+  tibble(
+    month        = ok$month[nrow(ok)],
+    ratio        = current,
+    normal_lower = b$lower,
+    normal_upper = b$upper,
+    jump_vs_last_month = jump,
+    result       = if (outside_band || big_jump) "FLAG" else "Pass"
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# 4. Plotly charts
+# ----------------------------------------------------------------------------
+
+#' Chart 1: does the kill track the calf crop of 1-3 years ago?
+#'
+#' Both series are 12-month rolling sums, indexed to 100 at the start so
+#' they can share an axis. If the two lines move together, falls in the
+#' kill are real (they were "announced" by the calf crop years earlier).
+#'
+#' @param results Output of cohort_check().
+#' @return A plotly figure. In RStudio it opens in the Viewer pane.
+plot_kill_vs_supply <- function(results) {
+  d <- filter(results, !is.na(ratio))
+  plot_ly(d, x = ~month) |>
+    add_lines(y = ~supply_index, name = "Calf supply born 1\u20133 yrs ago",
+              line = list(color = "#888888", width = 3)) |>
+    add_lines(y = ~kill_index, name = "Prime cattle kill",
+              line = list(color = "#1f77b4", width = 3)) |>
+    layout(
+      title = list(text = "Prime kill vs lagged net calf crop (12-month rolling, indexed)"),
+      yaxis = list(title = "Index (first month = 100)"),
+      xaxis = list(title = ""),
+      hovermode = "x unified",
+      legend = list(orientation = "h", y = -0.15)
+    )
+}
+
+
+#' Chart 2: the check statistic -- the ratio and its normal range
+#'
+#' The shaded band is the mean +/- 2 sigma of the ratio's own history
+#' (excluding the latest 12 months). The red dot is the latest month:
+#' inside the band = Pass, outside = FLAG.
+#'
+#' @param results Output of cohort_check().
+#' @return A plotly figure.
+plot_ratio <- function(results) {
+  d <- filter(results, !is.na(ratio))
+  b <- ratio_bands(results)
+  d <- mutate(d, band_lower = b$lower, band_upper = b$upper)
+
+  plot_ly(d, x = ~month) |>
+    add_ribbons(ymin = ~band_lower, ymax = ~band_upper,
+                name = "Normal range (\u00b12\u03c3)",
+                fillcolor = "rgba(200, 60, 60, 0.12)",
+                line = list(width = 0)) |>
+    add_lines(y = ~ratio, name = "Kill / supply ratio",
+              line = list(color = "#1f77b4", width = 3)) |>
+    add_markers(data = slice_tail(d, n = 1), y = ~ratio,
+                name = "Latest month",
+                marker = list(size = 11, color = "#d62728")) |>
+    layout(
+      title = list(text = "Cohort check: ratio of prime kill to lagged calf supply"),
+      yaxis = list(title = "Ratio (level is arbitrary \u2014 stability is the check)"),
+      xaxis = list(title = ""),
+      hovermode = "x unified",
+      legend = list(orientation = "h", y = -0.15)
+    )
+}
+
+
+# ----------------------------------------------------------------------------
+# 5. The one function an end user needs
+# ----------------------------------------------------------------------------
+
+#' Run the whole cohort check in one call
+#'
+#' @param births,exports,kill Your three input tables -- see README.md for
+#'   the exact columns.
+#' @param band_limits Age-band definitions; only change this if your export
+#'   file uses different band labels.
+#' @return A list with four things:
+#'   $results       -- the full month-by-month table (for the archive)
+#'   $latest_check  -- one-row Pass/FLAG verdict (for the sign-off note, L3.2)
+#'   $plot_tracking -- chart 1 (kill vs supply)
+#'   $plot_ratio    -- chart 2 (ratio with bands)
+#'
+#' @examples
+#' fake <- make_fake_data()
+#' out  <- run_cohort_check(fake$births, fake$exports, fake$kill)
+#' out$latest_check
+#' out$plot_ratio
+run_cohort_check <- function(births, exports, kill,
+                             band_limits = default_band_limits()) {
+  results <- cohort_check(births, exports, kill, band_limits)
+  list(
+    results       = results,
+    latest_check  = flag_latest_month(results),
+    plot_tracking = plot_kill_vs_supply(results),
+    plot_ratio    = plot_ratio(results)
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# 6. Fake data -- for the worked example and the tests only
+# ----------------------------------------------------------------------------
+
+#' Generate realistic fake input data
+#'
+#' With constant = FALSE (the default) you get spring-calving seasonality
+#' and random noise -- looks like real data, good for trying the charts.
+#' With constant = TRUE everything is flat and noise-free, and the prime
+#' kill is built to be exactly 0.6 x supply -- so the ratio must come out
+#' as exactly 0.6, which is what the tests check.
+#'
+#' @param n_years Length of the births series.
+#' @param constant TRUE for flat, deterministic data (used by the tests).
+#' @param seed Random seed, so results are reproducible.
+#' @return A list of three tables: births, exports, kill.
+make_fake_data <- function(n_years = 9, constant = FALSE, seed = 42) {
+  set.seed(seed)
+
+  months_all <- seq(as.Date("2017-01-01"), by = "month",
+                    length.out = n_years * 12)
+  n_m <- length(months_all)
+  mo  <- month(months_all)
+
+  # helpers that switch off noise/seasonality in constant mode
+  noise <- function(n, s) if (constant) rep(1, n) else 1 + rnorm(n, 0, s)
+  calving_season <- if (constant) rep(1, n_m) else {
+    1 + 1.5 * exp(-((mo - 3) %% 12)^2 / 4.5)     # peaks in March
+  }
+  kill_season <- if (constant) rep(1, n_m) else {
+    1 + 0.2 * cos((mo - 10) / 12 * 2 * pi)       # peaks in autumn
+  }
+
+  births <- tibble(
+    month  = months_all,
+    births = 55000 * calving_season * noise(n_m, 0.02)
+  )
+
+  # live exports: mostly young calves, tailing off with age
+  export_base <- tibble(
+    age_band = default_band_limits()$age_band,
+    base_n   = c(9000, 1500, 800, 400, 250, 150, 80)
+  )
+  exports <- crossing(month = months_all,
+                      age_band = export_base$age_band) |>
+    left_join(export_base, by = "age_band") |>
+    mutate(n = base_n * noise(n(), 0.05)) |>
+    select(month, age_band, n)
+
+  # calf slaughterings, needed before we can compute the supply
+  calves_killed <- 2500 * noise(n_m, 0.03)
+  kill_stub <- tibble(month = months_all, steers = 0, heifers = 0,
+                      bulls = 0, cows = 0, calves = calves_killed)
+
+  # build the prime kill as a fixed 60% of the supply the check will compute,
+  # so the "true" ratio behind the fake data is known to be 0.6
+  ncc <- net_calf_crop(births, exports, kill_stub)
+  supply <- ncc |>
+    arrange(month) |>
+    mutate(supply = slide_dbl(lag(ncc, 12), mean,
+                              .before = 24, .complete = TRUE)) |>
+    pull(supply)
+
+  pk <- 0.60 * supply * kill_season * noise(n_m, 0.03)
+  pk[is.na(pk)] <- 0   # months too early to have a supply; never used
+
+  kill <- tibble(
+    month   = months_all,
+    steers  = 0.45 * pk,
+    heifers = 0.35 * pk,
+    bulls   = 0.20 * pk,
+    cows    = 2800 * noise(n_m, 0.03),
+    calves  = calves_killed
+  )
+
+  list(births = births, exports = exports, kill = kill)
+}

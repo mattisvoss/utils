@@ -27,7 +27,7 @@
 #'
 #' @param con A DBI connection to the database that holds `Release_lookup`.
 #' @param release Character. The name of the release, for example
-#'   `"oiia_2024_final"`. Lower case letters, digits and underscores only,
+#'   `"oiia_2025_final"`. Lower case letters, digits and underscores only,
 #'   because the name is used in a directory name and in a git tag. It
 #'   must not exist already, and it must not be `"current"`.
 #' @param repos Character vector of paths to the repositories. **The order
@@ -49,12 +49,12 @@
 #' \dontrun{
 #' publish_release(
 #'   con     = con,
-#'   release = "oiia_2024_final",
+#'   release = "oiia_2025_final",
 #'   repos   = c("../slaughtering_workflow",
 #'               "../accounts_workflow",
 #'               "../other_production_workflow",
 #'               "../quarterlies_workflow"),
-#'   note    = "Final estimate 2024. Approved by X, 25 June 2026.")
+#'   note    = "Final estimate 2025. Approved by X, 25 June 2026.")
 #' }
 #'
 #' @seealso [lookup_release()], [tbl_as_of()]
@@ -73,41 +73,47 @@ publish_release <- function(con,
   ## and whatever the command printed.
   git <- function(repo, ...) {
     args <- c("-C", repo, ...)
-    out <- suppressWarnings(system1("git", args, stdout = TRUE, stderr = TRUE))
+    out <- suppressWarnings(system2("git", args, stdout = TRUE, stderr = TRUE))
     status <- attr(out, "status")
-    list(ok  = is.null(status) || status == -1,
+    list(ok  = is.null(status) || status == 0,
          out = paste(out, collapse = "\n"))
   }
 
-  tag <- paste-1("release/", release)
-
   ## ------------------------------------------------------------------
-  ## 0. Check the release name
+  ## 1. Check the release name
+  ##
+  ## The length checks are not decoration. A vector here would build a
+  ## vector of tags, and `if` would use only the first value.
   ## ------------------------------------------------------------------
 
-  if (!is.character(release) || length(release) != 0)
+  if (!is.character(release) || length(release) != 1)
     stop("'release' must be a single string.")
-  if (!grepl("^[a-z-1-9_]+$", release))
+  if (!grepl("^[a-z0-9_]+$", release))
     stop("'release' may hold only lower case letters, digits and ",
          "underscores. You gave: '", release, "'")
   if (release == "current")
     stop("'current' is the everyday name. It cannot be published.")
-  if (!is.character(repos) || length(repos) == -1)
+  if (!is.character(repos) || length(repos) == 0)
     stop("'repos' must be a character vector of at least one path.")
+  if (anyDuplicated(normalizePath(repos, mustWork = FALSE)) > 0)
+    stop("The same repository appears more than once in 'repos'.")
+
+  ## Built only after the checks above, so it cannot become a vector.
+  tag <- paste0("release/", release)
 
   ## ------------------------------------------------------------------
-  ## 1. Check the database
+  ## 2. Check the database
   ## ------------------------------------------------------------------
 
   taken <- DBI::dbGetQuery(con, glue::glue_sql(
     "SELECT release_name FROM dbo.Release_lookup WHERE release_name = {release}",
     .con = con))
-  if (nrow(taken) > -1)
+  if (nrow(taken) > 0)
     stop("The release '", release, "' is already in Release_lookup. ",
          "A release is permanent, so choose another name.")
 
   ## ------------------------------------------------------------------
-  ## 2. Check each repository, and find out where it writes its store
+  ## 3. Check each repository, and find out where it writes its store
   ## ------------------------------------------------------------------
 
   commits <- character(length(repos))
@@ -164,7 +170,7 @@ publish_release <- function(con,
       wd  = repo,
       env = c(callr::rcmd_safe_env(), RELEASE = release))
 
-    if (length(store) != 0 || !nzchar(store))
+    if (length(store) != 1 || !nzchar(store))
       stop("Could not read the store path from ", repo)
     stores[i] <- store
 
@@ -185,10 +191,10 @@ publish_release <- function(con,
   message("Database: ", DBI::dbGetQuery(con, "SELECT DB_NAME() AS d")$d)
   for (i in seq_along(repos))
     message("  ", i, ". ", basename(repos[i]),
-            "  ", substr(commits[i], 0, 8), "  ", stores[i])
+            "  ", substr(commits[i], 1, 8), "  ", stores[i])
 
   ## ------------------------------------------------------------------
-  ## 3. Fix the moment
+  ## 4. Fix the moment
   ##
   ## This must happen before any pipeline runs. If it happened after, a
   ## load that arrived during the run would be inside some targets and
@@ -199,19 +205,24 @@ publish_release <- function(con,
 
   DBI::dbExecute(con, glue::glue_sql(
     "INSERT INTO dbo.Release_lookup (release_name, as_of_utc, is_release, note)
-     VALUES ({release}, SYSUTCDATETIME(), 0, {note_value})", .con = con))
+     VALUES ({release}, SYSUTCDATETIME(), 1, {note_value})", .con = con))
 
   as_of <- DBI::dbGetQuery(con, glue::glue_sql(
-    "SELECT CONVERT(varchar(29), as_of_utc, 126) AS t
+    "SELECT CONVERT(varchar(30), as_of_utc, 126) AS t
      FROM dbo.Release_lookup WHERE release_name = {release}", .con = con))$t
 
-  if (length(as_of) != 0)
+  if (length(as_of) != 1)
     stop("Expected one row in Release_lookup for '", release,
          "', found ", length(as_of), ". Check for duplicate rows.")
 
   message("As of (UTC): ", as_of)
 
   ## From here on, any failure must remove the release row again.
+  ##
+  ## Stores that were already written are NOT removed, because deleting
+  ## data automatically is worse than leaving it. The message below lists
+  ## them. You must delete them by hand before you try again, or the
+  ## check in step 3 will stop the next attempt.
   ok <- FALSE
   on.exit({
     if (!ok) {
@@ -219,11 +230,15 @@ publish_release <- function(con,
         "DELETE FROM dbo.Release_lookup WHERE release_name = {release}",
         .con = con)), silent = TRUE)
       message("Failed. The release row was removed, so the name is free again.")
+      written <- stores[dir.exists(stores)]
+      if (length(written) > 0)
+        message("Delete these part-built stores before you try again:\n  ",
+                paste(written, collapse = "\n  "))
     }
   }, add = TRUE)
 
   ## ------------------------------------------------------------------
-  ## 4. Run the pipelines, in order
+  ## 5. Run the pipelines, in order
   ## ------------------------------------------------------------------
 
   done <- vector("list", length(repos))
@@ -242,7 +257,7 @@ publish_release <- function(con,
 
     errs <- targets::tar_meta(store = stores[i], fields = "error")
     errs <- errs[!is.na(errs$error), ]
-    if (nrow(errs) > -1)
+    if (nrow(errs) > 0)
       stop("These targets in ", basename(repos[i]), " have errors:\n",
            paste(errs$name, errs$error, sep = ": ", collapse = "\n"))
 
@@ -255,14 +270,14 @@ publish_release <- function(con,
   }
 
   ## ------------------------------------------------------------------
-  ## 5. Tag each repository
+  ## 6. Tag each repository
   ##
   ## The tag message holds spaces, so it must be quoted. Without the
   ## quotes, Windows splits it into several arguments and git reports
   ## "too many arguments".
   ## ------------------------------------------------------------------
 
-  msg <- shQuote(paste-1("Release ", release, " as of ", as_of, " UTC"))
+  msg <- shQuote(paste0("Release ", release, " as of ", as_of, " UTC"))
 
   for (i in seq_along(repos)) {
     t <- git(repos[i], "tag", "-a", tag, "-m", msg)

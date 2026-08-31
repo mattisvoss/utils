@@ -34,7 +34,8 @@
 #'   matters.** Each pipeline reads the store of an earlier one, so they
 #'   must run from the first input to the last output.
 #' @param note Character, optional. Why this release was made, and who
-#'   approved it. It is kept with the release row.
+#'   approved it. It is written to the `comment` column of the release
+#'   row.
 #' @param require_pushed Logical. If `TRUE` (the default), every commit
 #'   must already be on the remote.
 #'
@@ -111,6 +112,14 @@ publish_release <- function(con,
   if (nrow(taken) > 0)
     stop("The release '", release, "' is already in Release_lookup. ",
          "A release is permanent, so choose another name.")
+
+  used <- DBI::dbGetQuery(con, glue::glue_sql(
+    "SELECT component FROM dbo.Release_component WHERE release_name = {release}",
+    .con = con))
+  if (nrow(used) > 0)
+    stop("Release_component already holds rows for '", release, "':\n  ",
+         paste(used$component, collapse = "\n  "),
+         "\nThese are left over from an earlier attempt. Delete them first.")
 
   ## ------------------------------------------------------------------
   ## 3. Check each repository, and find out where it writes its store
@@ -203,8 +212,10 @@ publish_release <- function(con,
 
   note_value <- if (is.null(note)) NA_character_ else note
 
+  ## The column is called [comment]. It is bracketed because 'comment'
+  ## reads as a keyword and is easy to mistake for one.
   DBI::dbExecute(con, glue::glue_sql(
-    "INSERT INTO dbo.Release_lookup (release_name, as_of_utc, is_release, note)
+    "INSERT INTO dbo.Release_lookup (release_name, as_of_utc, is_release, [comment])
      VALUES ({release}, SYSUTCDATETIME(), 1, {note_value})", .con = con))
 
   as_of <- DBI::dbGetQuery(con, glue::glue_sql(
@@ -226,10 +237,15 @@ publish_release <- function(con,
   ok <- FALSE
   on.exit({
     if (!ok) {
+      ## Release_component first: it refers to the release name, so it
+      ## must go before the row it refers to.
+      try(DBI::dbExecute(con, glue::glue_sql(
+        "DELETE FROM dbo.Release_component WHERE release_name = {release}",
+        .con = con)), silent = TRUE)
       try(DBI::dbExecute(con, glue::glue_sql(
         "DELETE FROM dbo.Release_lookup WHERE release_name = {release}",
         .con = con)), silent = TRUE)
-      message("Failed. The release row was removed, so the name is free again.")
+      message("Failed. The release rows were removed, so the name is free again.")
       written <- stores[dir.exists(stores)]
       if (length(written) > 0)
         message("Delete these part-built stores before you try again:\n  ",
@@ -270,19 +286,38 @@ publish_release <- function(con,
   }
 
   ## ------------------------------------------------------------------
-  ## 6. Tag each repository
+  ## 6. Record the components, and tag each repository
   ##
   ## The tag message holds spaces, so it must be quoted. Without the
-  ## quotes, Windows splits it into several arguments and git reports
+  ## quotes the shell splits it into several arguments and git reports
   ## "too many arguments".
+  ##
+  ## After tagging, the tag is read back. An annotated tag holds the
+  ## release name in its own message. A lightweight tag holds nothing but
+  ## a commit, so if '-a' quietly failed you would see only a hash. The
+  ## read-back catches that.
   ## ------------------------------------------------------------------
 
   msg <- shQuote(paste0("Release ", release, " as of ", as_of, " UTC"))
 
   for (i in seq_along(repos)) {
+
+    DBI::dbExecute(con, glue::glue_sql(
+      "INSERT INTO dbo.Release_component (release_name, component, git_commit)
+       VALUES ({release}, {basename(repos[i])}, {commits[i]})", .con = con))
+
     t <- git(repos[i], "tag", "-a", tag, "-m", msg)
     if (!t$ok)
       stop("Could not tag ", repos[i], ":\n", t$out)
+
+    ## -n9 prints the tag message. An annotated tag shows the text above.
+    ## A lightweight tag shows the first line of the commit message.
+    check <- git(repos[i], "tag", "-n9", "-l", tag)
+    if (!grepl(release, check$out, fixed = TRUE))
+      stop("The tag in ", repos[i], " does not hold the release name.\n",
+           "git reported: ", check$out, "\n",
+           "Expected a message containing '", release, "'.")
+    message("  tag: ", check$out)
 
     p <- git(repos[i], "push", "origin", tag)
     if (!p$ok)

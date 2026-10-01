@@ -1,0 +1,70 @@
+﻿table,label,item,bold,space_before
+1.1,Goods Output,ACA03C17,,
+1.1,Intermediate Consumption,ACA03C23,,
+1.1,Net Subsidies,NET_SUBSIDIES,,
+1.1,Operating Surplus,ACA03C41,,
+1.2,Livestock,ACA03C01,TRUE,
+1.2,Cattle,ACA03C02,,
+1.2,Pigs,ACA03C03,,
+1.2,Sheep,ACA03C04,,
+1.2,Horses,ACA03C05,,
+1.2,Poultry,ACA03C06,,
+1.2,Livestock Products,ACA03C07,TRUE,TRUE
+1.2,Milk,ACA03C08,,
+1.2,Other Livestock Products,ACA03C09,,
+1.2,Crops,ACA03C10,TRUE,TRUE
+1.2,Cereals,ACA03C11,,
+1.2,Potatoes,ACA03C12,,
+1.2,Forage Plants,ACA03C13,,
+1.2,Fresh Vegetables,ACA03C14,,
+1.2,Fresh Fruit,ACA03C15,,
+1.2,Other Crops,ACA03C16,,
+1.2,Goods Output at Producer Prices,ACA03C17,TRUE,TRUE
+1.2,Contract Work,ACA03C18,,TRUE
+1.2,Subsidies on Products less Taxes on Products,ACA03C21,,TRUE
+1.2,Agricultural Output at Basic Prices,ACA03C22,TRUE,TRUE
+1.2,Intermediate Consumption,ACA03C23,TRUE,TRUE
+1.2,Feeding Stuffs,ACA03C24,,
+1.2,Fertilisers,ACA03C25,,
+1.2,FISIM¹,ACA03C26,,
+1.2,Seeds,ACA03C27,,
+1.2,Maintenance & Repairs,ACA03C28,,
+1.2,Other Goods & Services,ACA03C29,,
+1.2,Crop Protection Products,ACA03C30,,
+1.2,Veterinary Expenses,ACA03C31,,
+1.2,Energy & Lubricants,ACA03C32,,
+1.2,Forage Plants,ACA03C33,,
+1.2,Contract Work,ACA03C34,,
+1.2,Gross Value Added at Basic Prices,ACA03C35,TRUE,TRUE
+1.2,Fixed Capital Consumption,ACA03C36,,TRUE
+1.2,Net Value Added at Basic Prices,ACA03C37,TRUE,TRUE
+1.2,Other Subsidies less Taxes on Production,ACA03C38,,TRUE
+1.2,Factor Income,ACA03C39,TRUE,TRUE
+1.2,Compensation of Employees,ACA03C40,,TRUE
+1.2,Operating Surplus,ACA03C41,TRUE,TRUE
+1.2,Land Rental,ACA03C42,,TRUE
+1.2,Net Interest²,ACA03C43,,
+1.2,Entrepreneurial Income,ACA03C44,TRUE,TRUE
+1.3,Livestock,ACA03C01,,
+1.3,Livestock\nProducts,ACA03C07,,
+1.3,Crops,ACA03C10,,
+1.3,Goods Output\nat Producer\nPrices,ACA03C17,,
+1.3,Agricultural\nOutput at\nBasic Prices,ACA03C22,,
+1.3,Intermediate\nConsumption,ACA03C23,,
+1.3,Gross Value\nAdded at\nBasic Prices,ACA03C35,,
+1.3,Net\nSubsidies¹,NET_SUBSIDIES,,
+1.3,Operating\nSurplus,ACA03C41,,
+1.3,Entrepreneurial\nIncome,ACA03C44,,
+1.4,Net Subsidies,NET_SUBSIDIES,,
+1.4,Operating Surplus,ACA03C41,,
+1.4,Net Subsidies as a % of Operating Surplus,NET_SUBSIDIES_PCT_OS,,
+2.x,Livestock,ACA03C01,,
+2.x,Livestock Products,ACA03C07,,
+2.x,Crops,ACA03C10,,
+2.x,Goods Output at Producer Prices,ACA03C17,,
+2.x,Agricultural Output at Basic Prices,ACA03C22,,
+2.x,Intermediate Consumption,ACA03C23,,
+2.x,Gross Value Added at Basic Prices,ACA03C35,,
+2.x,Net Subsidies,NET_SUBSIDIES,,
+2.x,Operating Surplus,ACA03C41,,
+2.x,Entrepreneurial Income,ACA03C44,,

@@ -5,7 +5,8 @@
 #   regional line targets  -->  regional_items  -->  eaa_obs  -->  eurostat_files
 #
 # regional_items has one row for each fact:
-#   source     line target that the fact came from (for messages and checks)
+#   source     line target(s) that the fact came from, for example
+#              "honey_regional_value + wool_regional_value"
 #   item       Eurostat item code, for example "AM111000"
 #   component  "value"   = value at producer prices, or the only value of a
 #                          non-output item (CFC, interest, GFCF, ...)
@@ -49,9 +50,13 @@
 #'   No conditions = all rows.
 #' @param item      Eurostat item code, for example "AM111000".
 #' @param component "value", "subsidy" or "tax".
-#' @param add_up    FALSE: the rows must have one row for each county and year.
-#'   TRUE: add up the rows for the same county and year into one value (for
-#'   example four animals into one GFCF item).
+#' @param add_up    FALSE: this take() is the only source of the item, with one
+#'   row for each county and year.
+#'   TRUE: add these rows into the item, together with the other rows for the
+#'   same county and year. The other rows can come from this take() (for
+#'   example four animals into one GFCF item), or from other take() calls for
+#'   the same item (for example wool and honey into AM129000). Every take()
+#'   for that item must then have add_up = TRUE.
 #' @param again     FALSE: normal use. TRUE: use rows that another take()
 #'   already uses, a second time, for a different item. Use it only for a value
 #'   that the EAA records two times, for example contract work, which is output
@@ -160,27 +165,20 @@ combine_regional_items <- function(parts) {
     stop("The items above have NA in val.")
   }
 
-  # 3. One take() gives one row for each county and year, unless add_up = TRUE.
+  # 3. One value for each item, component, county and year. Rows are added
+  #    only if every take() that gives them has add_up = TRUE. This catches
+  #    two take() calls that give the same item by mistake.
   combined <- facts |>
-    group_by(source, item, component, county, year) |>
-    summarise(n = n(), add_up = any(add_up),
-              val = sum(val), val_pyp = sum(val_pyp), .groups = "drop")
-  not_unique <- filter(combined, n > 1 & !add_up)
-  if (nrow(not_unique) > 0) {
-    print(distinct(not_unique, source, item, component))
-    stop("These take() calls select more than one row for the same county and year. ",
-         "Make the conditions more exact, or use add_up = TRUE if the rows must be added.")
-  }
-
-  # 4. Each item and component comes from one line target only.
-  #    This catches two take() calls that give the same item by mistake.
-  dup <- combined |>
     group_by(item, component, county, year) |>
-    filter(n() > 1) |>
-    ungroup()
-  if (nrow(dup) > 0) {
-    print(distinct(dup, item, component, source))
-    stop("More than one line target gives the same item and component (see above).")
+    summarise(n = n(), all_add_up = all(add_up),
+              source = paste(sort(unique(source)), collapse = " + "),
+              val = sum(val), val_pyp = sum(val_pyp), .groups = "drop")
+  not_unique <- filter(combined, n > 1 & !all_add_up)
+  if (nrow(not_unique) > 0) {
+    print(distinct(not_unique, item, component, source))
+    stop("More than one row gives the same item, component, county and year (see above). ",
+         "Make the conditions more exact. If the rows must be added, use add_up = TRUE ",
+         "in every take() for that item.")
   }
 
   combined |>
@@ -200,7 +198,8 @@ combine_regional_items <- function(parts) {
 #    or by one skip() with a reason. If a row is not used, or is used two times,
 #    the code stops and tells you the line target and the rows.
 # 4. Use add_up = TRUE only where several rows for the same county and year must
-#    be added into one item.
+#    be added into one item. The rows can come from one line target or from
+#    several. If they come from several, every take() for that item needs it.
 # 5. Read the LAST long target of each line. Do not read a target that feeds a
 #    target that you already read (for example motor_tax_regional_value, which is
 #    in production_tax_regional_value). Do not read a target that is only a sum of
@@ -238,6 +237,9 @@ assemble_regional_items <- function(
     # Example:
     # take(cereals_regional_value, sub_product == "common_wheat", item = "AM011100"),
     # take(cereals_regional_value, sub_product == "barley",       item = "AM013000"),
+    # Example of two line targets in one item (add_up = TRUE in both):
+    # take(wool_regional_value,  product == "wool",  item = "AM129000", add_up = TRUE),
+    # take(honey_regional_value, product == "honey", item = "AM129000", add_up = TRUE),
 
     # ==== Intermediate consumption: component "value" ==========================
     # TODO: one take() for each IC item, for example AM201000 Seeds, AM206011,

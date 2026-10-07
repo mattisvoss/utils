@@ -52,8 +52,13 @@
 #' @param add_up    FALSE: the rows must have one row for each county and year.
 #'   TRUE: add up the rows for the same county and year into one value (for
 #'   example four animals into one GFCF item).
+#' @param again     FALSE: normal use. TRUE: use rows that another take()
+#'   already uses, a second time, for a different item. Use it only for a value
+#'   that the EAA records two times, for example contract work, which is output
+#'   of agricultural services (AM150000) and also intermediate consumption of
+#'   agricultural services (AM209100).
 #' @return The selected rows. combine_regional_items() checks them.
-take <- function(source, ..., item, component = "value", add_up = FALSE) {
+take <- function(source, ..., item, component = "value", add_up = FALSE, again = FALSE) {
   name <- deparse(substitute(source))
 
   need <- c("county", "year_concerned", "val", "val_pyp")
@@ -78,7 +83,7 @@ take <- function(source, ..., item, component = "value", add_up = FALSE) {
   # n first: inside tibble(), the name "source" is the new text column.
   n <- nrow(source)
   tibble(source = name, source_row = rows$source_row, source_nrow = n,
-         item = item, component = component, add_up = add_up,
+         item = item, component = component, add_up = add_up, again = again,
          county = as.character(rows$county),
          year = as.integer(rows$year_concerned),
          val = rows$val, val_pyp = rows$val_pyp)
@@ -102,7 +107,8 @@ skip <- function(source, ..., reason) {
   if (nrow(rows) == 0) stop(name, ": no rows match the conditions of skip().")
 
   n <- nrow(source)
-  tibble(source = name, source_row = rows$source_row, source_nrow = n, item = NA_character_)
+  tibble(source = name, source_row = rows$source_row, source_nrow = n,
+         item = NA_character_, again = FALSE)
 }
 
 
@@ -113,21 +119,32 @@ skip <- function(source, ..., reason) {
 combine_regional_items <- function(parts) {
   all <- bind_rows(parts)
 
-  # 1. Each row of each line target is used exactly one time.
-  #    Nothing is lost, and nothing is counted two times.
-  twice <- count(all, source, source_row) |> filter(n > 1)
+  # 1. Each row of each line target is used exactly one time (not counting
+  #    take(again = TRUE)). Nothing is lost, and nothing is counted two times.
+  first <- all[!all$again, ]
+  twice <- count(first, source, source_row) |> filter(n > 1)
   if (nrow(twice) > 0) {
     print(twice)
-    stop("The rows above are selected by more than one take() or skip().")
+    stop("The rows above are selected by more than one take() or skip(). ",
+         "If a value must be used for two items, use take(again = TRUE) for the second item.")
   }
-  for (s in unique(all$source)) {
-    n <- all$source_nrow[all$source == s][1]
-    not_used <- setdiff(seq_len(n), all$source_row[all$source == s])
+  for (s in unique(first$source)) {
+    n <- first$source_nrow[first$source == s][1]
+    not_used <- setdiff(seq_len(n), first$source_row[first$source == s])
     if (length(not_used) > 0) {
       stop(s, ": ", length(not_used), " rows are not used (rows ",
            paste(head(not_used, 10), collapse = ", "), if (length(not_used) > 10) ", ...",
            "). Give them an item with take(), or remove them with skip().")
     }
+  }
+
+  # A second use must be of a row that a normal take() already uses.
+  # Otherwise it is a first use, and again = TRUE hides it from check 1.
+  used <- paste(first$source, first$source_row)[!is.na(first$item)]
+  second <- all[all$again, ]
+  if (any(!paste(second$source, second$source_row) %in% used)) {
+    print(distinct(second[!paste(second$source, second$source_row) %in% used, ], source, item))
+    stop("take(again = TRUE) selects rows that no normal take() uses (see above).")
   }
 
   facts <- all[!is.na(all$item), ]
@@ -224,8 +241,16 @@ assemble_regional_items <- function(
 
     # ==== Intermediate consumption: component "value" ==========================
     # TODO: one take() for each IC item, for example AM201000 Seeds, AM206011,
-    # AM206012 and AM206020 Feedingstuffs, AM207000 and AM208000 Maintenance.
-    # Do not add the total AM200000.
+    # AM206012 and AM206020 Feedingstuffs, AM207000 and AM208000 Maintenance,
+    # AM209200 FISIM. Do not add the total AM200000.
+    # Read the input targets (seed_regional_value, fertiliser_regional_value,
+    # ...), not total_intermediate_consumption_less_fisim_regional_value: it is
+    # a total, and it does not include FISIM, which Eurostat needs as an item.
+    # A broad target such as nfs_inputs_regional_value can give several items:
+    # one take() for each. Skip its rows that another target already gives.
+    # Example of a value that the EAA records two times:
+    # take(outputs_regional_value, product == "contract_work",
+    #      item = "AM209100", again = TRUE),     # IC of agricultural services
 
     # ==== Taxes on products (DATA_03): component "tax" =========================
     # The item is the product that the tax is on. CHECK

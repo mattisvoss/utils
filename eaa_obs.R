@@ -46,6 +46,9 @@
 #              write_eaa_excel(eaa_obs, years = 2022:2024, template_dir = "config/templates",
 #                              out_dir = "output/eurostat_excel"),
 #              format = "file")
+#
+# For the parallel run, compare a new Excel file with the file that was sent:
+#   compare_eaa_excel("output/eurostat_excel/AMS_EAACURR_A_IE_2024.xlsx", "<the sent CURR file>")
 
 
 make_eaa_obs <- function(regional_items, hierarchy_file, items_file) {
@@ -151,7 +154,12 @@ make_eaa_obs <- function(regional_items, hierarchy_file, items_file) {
     stop("These items are zero in the item table, but have a value.")
   }
   x$value[is_zero] <- 0
-  x$flag <- if_else(x$non_significant == "Y", "N", NA_character_)
+
+  # The N flag is on the production value only: PRD_PP, and PRD_BP, which is
+  # the same value. A subsidy or tax on that product is not an estimate that
+  # we left out. It is a true 0 (no scheme or levy exists), so it has no flag.
+  x$flag <- if_else(x$non_significant == "Y" & !x$component %in% c("subsidy", "tax"),
+                    "N", NA_character_)
 
   # Items that are not sent at previous-year prices keep their row, with NA.
   # The file shows them as NaN, as in the Eurostat examples.
@@ -358,4 +366,94 @@ items_below <- function(hierarchy, top) {
     if (length(new) == 0) return(out)
     out <- c(out, new)
   }
+}
+
+
+#' Read a filled Eurostat Excel template into a long table
+#'
+#' Reads the four DATA sheets of a CURR or CONR template. It works for the files
+#' from write_eaa_excel() and for the files of the old Excel system, because both
+#' use the Eurostat template: item codes in row 5, region codes in column A from
+#' row 7, and three columns for each item (value, flag, comment).
+#' Excel formulas are read as the last value that Excel calculated and saved.
+#'
+#' @param file A filled template, for example "AMS_EAACURR_A_IE_2024.xlsx".
+#' @return One row for each STAT_CHAR, region and item: STAT_CHAR, REF_AREA,
+#'   AM_ITEM, TIME_PERIOD, OBS_VALUE (NA = empty cell), OBS_STATUS, OBS_COMMENT.
+read_eaa_excel <- function(file) {
+  sheets <- c(PRD_PP = "DATA_01", SUB = "DATA_02", TAX = "DATA_03", PRD_BP = "DATA_04")
+  out <- list()
+
+  for (sc in names(sheets)) {
+    # Read the cells as they are, then make a text matrix: m[row, column].
+    cells <- readxl::read_excel(file, sheet = sheets[[sc]], range = "A1:ZZ12", col_names = FALSE,
+                                col_types = "list", .name_repair = "minimal")
+    m <- sapply(cells, function(column) {
+      sapply(column, function(v) if (is.null(v) || is.na(v)) NA_character_ else as.character(v))
+    })
+
+    item_cols   <- which(grepl("^AM[0-9]{6}$", m[5, ]))     # row 5: item codes
+    region_rows <- 6 + which(!is.na(m[7:12, 1]))             # column A, from row 7
+
+    cell <- expand.grid(row = region_rows, col = item_cols)
+    out[[sc]] <- tibble(STAT_CHAR   = sc,
+                        REF_AREA    = m[cbind(cell$row, 1)],
+                        AM_ITEM     = m[cbind(5, cell$col)],
+                        TIME_PERIOD = as.integer(m[4, 1]),          # A4: the year
+                        OBS_VALUE   = suppressWarnings(as.numeric(m[cbind(cell$row, cell$col)])),
+                        OBS_STATUS  = m[cbind(cell$row, cell$col + 1)],
+                        OBS_COMMENT = m[cbind(cell$row, cell$col + 2)])
+  }
+  bind_rows(out)
+}
+
+
+#' Compare two filled Eurostat Excel templates, cell by cell
+#'
+#' For the parallel run: compare the file from write_eaa_excel() with the file
+#' that the old Excel system sent to Eurostat. Call it one time for CURR and
+#' one time for CONR. Comments are not compared.
+#'
+#' @param new_file  The new file, for example from write_eaa_excel().
+#' @param old_file  The file that was sent to Eurostat.
+#' @param tolerance The largest difference that counts as the same value.
+#'   The unit is million euro, so 0.001 = 1,000 euro.
+#' @return Only the cells that are different, with the column problem:
+#'   "value"        both have a number, and the numbers are different
+#'   "empty in new" the old file has a number, the new file has an empty cell
+#'   "empty in old" the new file has a number, the old file has an empty cell
+#'   "flag"         the values are the same, but the flags are different
+#'   "only in new" / "only in old"  the cell is in one template only
+compare_eaa_excel <- function(new_file, old_file, tolerance = 0.001) {
+  new <- read_eaa_excel(new_file)
+  old <- read_eaa_excel(old_file)
+
+  if (!identical(unique(new$TIME_PERIOD), unique(old$TIME_PERIOD))) {
+    warning("The files are for different years: ", unique(new$TIME_PERIOD), " and ",
+            unique(old$TIME_PERIOD), ". Check that you compare the correct files.")
+  }
+
+  x <- full_join(select(new, STAT_CHAR, REF_AREA, AM_ITEM, new = OBS_VALUE, flag_new = OBS_STATUS),
+                 select(old, STAT_CHAR, REF_AREA, AM_ITEM, old = OBS_VALUE, flag_old = OBS_STATUS),
+                 by = c("STAT_CHAR", "REF_AREA", "AM_ITEM"))
+  in_new <- paste(x$STAT_CHAR, x$REF_AREA, x$AM_ITEM) %in% paste(new$STAT_CHAR, new$REF_AREA, new$AM_ITEM)
+  in_old <- paste(x$STAT_CHAR, x$REF_AREA, x$AM_ITEM) %in% paste(old$STAT_CHAR, old$REF_AREA, old$AM_ITEM)
+
+  x <- x |>
+    mutate(diff = new - old,
+           pct  = if_else(old != 0, round(100 * diff / abs(old), 2), NA_real_),
+           problem = case_when(
+             !in_old                                ~ "only in new",
+             !in_new                                ~ "only in old",
+             is.na(new) & !is.na(old)               ~ "empty in new",
+             !is.na(new) & is.na(old)               ~ "empty in old",
+             !is.na(diff) & abs(diff) > tolerance   ~ "value",
+             coalesce(flag_new, "") != coalesce(flag_old, "") ~ "flag",   # NA = no flag
+             TRUE                                   ~ NA_character_))
+
+  cat("Compared", nrow(x), "cells.", sum(!is.na(x$problem)), "are different.\n")
+  x |>
+    filter(!is.na(problem)) |>
+    select(problem, STAT_CHAR, REF_AREA, AM_ITEM, new, old, diff, pct, flag_new, flag_old) |>
+    arrange(match(STAT_CHAR, c("PRD_PP", "SUB", "TAX", "PRD_BP")), REF_AREA, AM_ITEM)
 }

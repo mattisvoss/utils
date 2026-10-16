@@ -21,10 +21,11 @@ made from `regional_items` too (see "The plan" at the end).
 
 | File | Contents | Who changes it |
 |---|---|---|
-| `R/regional_items.R` | `take()` and `skip()`, and `assemble_regional_items()`: the map from the line targets to the Eurostat item codes | you, when a line target changes |
-| `R/eaa_obs.R` | `make_eaa_obs()`, `write_eaa_sdmx()`, `write_eaa_excel()` | rarely |
+| `R/regional_items.R` | `take()`, `skip()`, `add_val_pyp()`, and `assemble_regional_items()`: the map from the line targets to the Eurostat item codes | you, when a line target changes |
+| `R/eaa_obs.R` | `make_eaa_obs()`, `write_eaa_sdmx()`, `write_eaa_excel()`, `compare_eaa_excel()` | rarely |
 | `config/eaa_hierarchy.csv` | how the items add up: `parent`, `child`, `sign` | almost never (the same for every country) |
 | `config/eaa_items.csv` | your item table: which items are zero, non-significant, or not sent in CONR | the section, when Irish practice changes |
+| `config/fisim_national.csv` | FISIM for the State at current and previous-year prices, from National Accounts | you, each year |
 | `config/templates/AMS_EAACURR_A_IE.xlsx`, `AMS_EAACONR_A_IE.xlsx` | the empty Eurostat Excel templates | only when Eurostat sends new templates |
 
 ---
@@ -62,18 +63,6 @@ Name each line target in the `regional_items` command. Targets finds the
 dependencies by reading the command. If a function reads a target with
 `tar_read()`, targets cannot see the dependency, and `regional_items` does not
 run again when that line target changes.
-
-### 2.3 One time only: add `empty_in_conr` to the item table
-
-> **Run this one time, then delete this section from the README.**
-
-```r
-items <- readr::read_csv("config/eaa_items.csv", col_types = readr::cols(.default = "c"))
-not_in_conr <- c("AM290000", "AM300000", "AM310000", "AM320000", "AM330000", "AM340000",
-                 "AM350000", "AM360000", "AM370000", "AM380000", "AM390000")
-items$empty_in_conr <- ifelse(items$estat_item %in% not_in_conr, "Y", "N")
-readr::write_csv(items, "config/eaa_items.csv")
-```
 
 ---
 
@@ -210,6 +199,42 @@ A list (`%in%`) is closed: a new sub-product stops the code. An exclusion is
 open: a new sub-product goes into the item without a message. Use an exclusion
 only for a residual item, such as AM029000 "Other industrial crops".
 
+### 4.3 An item with county values only at current prices (FISIM)
+
+National Accounts gives FISIM for the State at current prices and at
+previous-year prices. The county split exists only at current prices.
+`add_val_pyp()` gives each county the national ratio of its year:
+
+    county val_pyp = county val × (national val_pyp ÷ national val)
+
+This is correct because the county split is a split of quantity (loans or
+output), not a different price in each county. The counties then add up to the
+national `val_pyp` exactly.
+
+Put the national values in `config/fisim_national.csv`, one row for each year:
+
+```
+year,val,val_pyp,source
+2023,60.0,58.0,example only - replace
+2024,84.0,61.2,example only - replace
+```
+
+Then add a target that gives the county FISIM its `val_pyp`, and `take()` that
+target in `assemble_regional_items()`:
+
+```r
+tar_target(fisim_national_file, "config/fisim_national.csv", format = "file"),
+tar_target(fisim_national, readr::read_csv(fisim_national_file, col_types = "iddc")),
+tar_target(fisim_regional_pyp, add_val_pyp(fisim_regional_value, fisim_national)),
+```
+
+`add_val_pyp()` stops if the counties do not add up to the national `val`
+(more than 1,000 euro difference). That means the two tables are from
+different vintages, and the ratio would be wrong.
+
+Interest minus FISIM (AM350000) needs nothing: it is property income, not a
+product, so it has no previous-year prices. CONR does not send it.
+
 ---
 
 ## 5. What `make_eaa_obs()` does
@@ -222,7 +247,7 @@ only for a residual item, such as AM029000 "Other industrial crops".
 | 4 | basic price = value + subsidy − tax | |
 | 5 | totals and balancing items | each total when all its parts are known, repeated until all are known |
 | 6 | keep the components that exist | 4 for output items, only basic for the others |
-| 7 | item table rules | zero → 0; non-significant → 0 and flag N; not sent in CONR → NA |
+| 7 | item table rules | zero → 0; non-significant → 0 and flag N (PRD_PP and PRD_BP only); not sent in CONR → NA |
 | 8 | IE0 = IE | |
 | 9 | the SDMX columns | |
 
@@ -243,7 +268,7 @@ only for a residual item, such as AM029000 "Other industrial crops".
 | UNIT_MEASURE | `MIO_NAC` |
 | TIME_PERIOD | the year |
 | OBS_VALUE | the number; NA = not sent |
-| OBS_STATUS | `N` for non-significant items, else empty |
+| OBS_STATUS | `N` on PRD_PP and PRD_BP of non-significant items, else empty. SUB and TAX are a true 0, so they have no flag. |
 | CONF_STATUS, OBS_COMMENT, UNIT_MULT | empty |
 | OBS_PERIOD | `3009NP1` |
 | DECIMALS | `7` |
@@ -256,7 +281,7 @@ only for a residual item, such as AM029000 "Other industrial crops".
 |---|---|
 | `estat_item` | the item code. All 90 items must be in the table. |
 | `zero_for_IE` | `Y`: the item is 0 for Ireland |
-| `non_significant` | `Y`: the item is 0 and gets the flag N |
+| `non_significant` | `Y`: the item is 0. PRD_PP and PRD_BP get the flag N; SUB and TAX do not |
 | `empty_in_conr` | `Y`: the item is not sent at previous-year prices (NaN in CONR) |
 
 Other columns, such as `estat_label`, are allowed and not used.
@@ -289,6 +314,40 @@ from row 7). A value that is not sent stays an empty cell.
 Do not send these files to Eurostat. `openxlsx` drops the SharePoint metadata
 of the template when it saves the file. That does not matter for a check file.
 
+### 7.3 Compare with the file that was sent: `compare_eaa_excel()`
+
+For the parallel run. It reads two filled templates and lists the cells that
+are different. Call it one time for CURR and one time for CONR:
+
+```r
+curr <- compare_eaa_excel("output/eurostat_excel/AMS_EAACURR_A_IE_2024.xlsx",
+                          "sent/<the CURR file that was sent>.xlsx")
+conr <- compare_eaa_excel("output/eurostat_excel/AMS_EAACONR_A_IE_2024.xlsx",
+                          "sent/<the CONR file that was sent>.xlsx")
+View(curr)
+```
+
+The result has one row for each cell that is different: `problem`,
+`STAT_CHAR`, `REF_AREA`, `AM_ITEM`, `new`, `old`, `diff`, `pct`, `flag_new`,
+`flag_old`.
+
+| problem | Meaning |
+|---|---|
+| `value` | both files have a number, and the difference is more than `tolerance` (default 0.001 = 1,000 euro) |
+| `empty in new` / `empty in old` | one file has a number, the other has an empty cell |
+| `flag` | the values agree, but the flags do not |
+| `only in new` / `only in old` | the cell is in one template only (the templates are different) |
+
+- **Start with the detailed items.** One different detailed item makes every
+  total above it different too. When the detailed items agree, the totals agree.
+- The function warns if the two files are for different years (cell A4).
+- Comments are not compared.
+- `read_eaa_excel(file)` is the reader that it uses. It gives one file as a long
+  table, if you want to look at one file alone.
+- Excel formulas are read as the last value that Excel saved. A file that
+  openxlsx saved two times (load, save, load, save) cannot be read by readxl.
+  The files from `write_eaa_excel()` and from Excel are not affected.
+
 ---
 
 ## 8. Each year
@@ -296,9 +355,10 @@ of the template when it saves the file. That does not matter for a check file.
 1. Change `years` in the two writer targets (Ireland sends the three most
    recent years).
 2. Check the item table: did a zero item get a value, or a new item appear?
+   Add the new year to `config/fisim_national.csv`.
 3. Run `tar_make()`. Fix any stop (see section 9).
-4. Compare the Excel files with the old system (parallel run), or with last
-   year's transmission. Eurostat flags a change of more than 15% from the
+4. Compare the Excel files with the old system (parallel run) with
+   `compare_eaa_excel()` (section 7.3), or with last year's transmission. Eurostat flags a change of more than 15% from the
    last transmission.
 5. Check that the IE row agrees with the national EAA transmission, for
    current and previous-year prices. Eurostat checks this.
@@ -344,6 +404,10 @@ of the template when it saves the file. That does not matter for a check file.
 - In the Excel template, cell A3 (the country) is also "IE". A search for the
   region "IE" in the whole of column A finds row 3, not row 7. The writer
   searches only from row 7.
+- The first version gave the flag N to all four STAT_CHARs of a
+  non-significant item. The flag must be only on PRD_PP and PRD_BP, because
+  SUB and TAX are a true 0. The Excel check counted the wrong flags as correct;
+  a person found the error in the parallel run.
 
 ---
 
@@ -353,6 +417,9 @@ of the template when it saves the file. That does not matter for a check file.
   are not in the fodder table.
 - How the State-only "all" capital transfers are allocated to counties.
 - Does Eurostat want OBS_STATUS `N` in SDMX? The example files have no flags.
+- FISIM (AM209200) at previous-year prices: confirm that National Accounts
+  gives the agriculture value at previous-year prices (or the deflator), and
+  that the national EAA uses the same value. See section 4.3.
 
 ## 12. The plan
 
@@ -362,3 +429,21 @@ of the template when it saves the file. That does not matter for a check file.
    years, switch, and delete `mastersheet_output_regional`.
 3. Later: the same detail in the national accounts, so that all outputs read
    the same data.
+4. Later (not for the 2026 transmission): explicit flags and comments for
+   every observation. Today the only flag is N, and it comes from the item
+   table. The design questions:
+   - **Where the flags start.** Two new columns in `regional_items`,
+     `obs_status` and `obs_comment`, filled in by `take()`. The person who
+     writes a line knows if its value is estimated or provisional.
+   - **Totals.** A value adds up; a flag does not. Step 2 (counties to
+     regions) and step 5 (the totals) each need a rule next to the sum. The
+     usual rule: a total gets a flag if any part has it, with a priority order
+     (for example E before P before A).
+   - **Comments.** They do not add up. Keep a comment only on the row where
+     someone wrote it, and do not copy it to the totals.
+   - **Codes.** OBS_STATUS uses the SDMX code list (A normal, E estimated,
+     P provisional, N non-significant, and others). Ask Eurostat which codes
+     they accept for the EAA before you build anything.
+   - **Writers.** `write_eaa_sdmx()` and `write_eaa_excel()` already carry
+     OBS_STATUS through. The Excel writer would also need to write the comment
+     column.

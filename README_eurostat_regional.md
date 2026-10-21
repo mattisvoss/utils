@@ -247,7 +247,7 @@ product, so it has no previous-year prices. CONR does not send it.
 | 4 | basic price = value + subsidy − tax | |
 | 5 | totals and balancing items | each total when all its parts are known, repeated until all are known |
 | 6 | keep the components that exist | 4 for output items, only basic for the others |
-| 7 | item table rules | zero → 0; non-significant → 0 and flag N (PRD_PP and PRD_BP only); not sent in CONR → NA |
+| 7 | item table rules | zero → 0; non-significant → 0 and flag N, separately for PRD_PP (and PRD_BP), SUB and TAX; not sent in CONR → NA |
 | 8 | IE0 = IE | |
 | 9 | the SDMX columns | |
 
@@ -281,8 +281,19 @@ product, so it has no previous-year prices. CONR does not send it.
 |---|---|
 | `estat_item` | the item code. All 90 items must be in the table. |
 | `zero_for_IE` | `Y`: the item is 0 for Ireland |
-| `non_significant` | `Y`: the item is 0. PRD_PP and PRD_BP get the flag N; SUB and TAX do not |
+| `non_significant` | `Y`: the production value is non-significant. PRD_PP is 0 and gets the flag N. PRD_BP also gets N, because it contains PRD_PP |
+| `non_significant_sub` | `Y`: the subsidies on the product are non-significant. SUB is 0 and gets the flag N (example: AM179000) |
+| `non_significant_tax` | `Y`: the taxes on the product are non-significant. TAX is 0 and gets the flag N |
 | `empty_in_conr` | `Y`: the item is not sent at previous-year prices (NaN in CONR) |
+
+The three `non_significant` columns are independent: each one controls only
+its own STAT_CHAR, and any combination is allowed. Example: a product with a
+non-significant production value but a real coupled subsidy has
+`non_significant = Y` and `non_significant_sub = N`. Then PRD_PP is 0 (N), SUB
+is the real subsidy, and PRD_BP = SUB (N). `non_significant_sub` and
+`non_significant_tax` are only for output items (AM180000 and below).
+
+A SUB or TAX of 0 with no flag means "no scheme or levy exists" (a true 0).
 
 Other columns, such as `estat_label`, are allowed and not used.
 

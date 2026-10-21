@@ -34,7 +34,8 @@
 # Two configuration files:
 #   config/eaa_hierarchy.csv  parent, child, sign. The same for every country.
 #   config/eaa_items.csv      your item table: estat_item, zero_for_IE,
-#                             non_significant, empty_in_conr (Y or N).
+#                             non_significant, non_significant_sub,
+#                             non_significant_tax, empty_in_conr (Y or N).
 #
 # In _targets.R:
 #   tar_target(eaa_hierarchy_file, "config/eaa_hierarchy.csv", format = "file"),
@@ -55,7 +56,11 @@ make_eaa_obs <- function(regional_items, hierarchy_file, items_file) {
 
   hierarchy <- readr::read_csv(hierarchy_file, col_types = "ccd")
   items     <- readr::read_csv(items_file, col_types = readr::cols(.default = "c"))
-  for (col in c("zero_for_IE", "non_significant", "empty_in_conr")) {
+  for (col in c("zero_for_IE", "non_significant", "non_significant_sub", "non_significant_tax",
+                "empty_in_conr")) {
+    if (!col %in% names(items)) {
+      stop(items_file, " has no column ", col, ".")
+    }
     if (!all(items[[col]] %in% c("Y", "N"))) {
       stop(items_file, ": ", col, " must be Y or N in every row.")
     }
@@ -64,6 +69,13 @@ make_eaa_obs <- function(regional_items, hierarchy_file, items_file) {
   totals       <- unique(hierarchy$parent)               # calculated here, never in regional_items
   detail_items <- setdiff(items$estat_item, totals)       # from regional_items, or zero
   output_items <- items_below(hierarchy, "AM180000")      # have subsidies and taxes on products
+
+  wrong <- items$estat_item[(items$non_significant_sub == "Y" | items$non_significant_tax == "Y") &
+                              !items$estat_item %in% output_items]
+  if (length(wrong) > 0) {
+    stop(items_file, ": non_significant_sub and non_significant_tax can only be Y for output ",
+         "items. Not for: ", paste(wrong, collapse = ", "))
+  }
 
 
   # 1. Check that every detailed item has a source.
@@ -148,17 +160,30 @@ make_eaa_obs <- function(regional_items, hierarchy_file, items_file) {
   # 7. Rules from the item table.
   x <- left_join(x, items, by = c(item = "estat_item"))
 
-  is_zero <- x$zero_for_IE == "Y" | x$non_significant == "Y"
+  # Each non_significant column describes one STAT_CHAR. The columns are
+  # independent: any combination is allowed.
+  #   non_significant      the production value (PRD_PP) is 0, flag N
+  #   non_significant_sub  SUB is 0, flag N
+  #   non_significant_tax  TAX is 0, flag N
+  # zero_for_IE: everything is 0, no flag.
+  # A non-output item has only the row "basic", and that row is its production value.
+  production <- x$component == "value" | (x$component == "basic" & !x$item %in% output_items)
+
+  is_zero <- x$zero_for_IE == "Y" |
+             (x$non_significant     == "Y" & production) |
+             (x$non_significant_sub == "Y" & x$component == "subsidy") |
+             (x$non_significant_tax == "Y" & x$component == "tax")
   if (any(is_zero & abs(x$value) > 1e-9, na.rm = TRUE)) {
     print(distinct(x[which(is_zero & abs(x$value) > 1e-9), ], item, component, measure))
     stop("These items are zero in the item table, but have a value.")
   }
   x$value[is_zero] <- 0
 
-  # The N flag is on the production value only: PRD_PP, and PRD_BP, which is
-  # the same value. A subsidy or tax on that product is not an estimate that
-  # we left out. It is a true 0 (no scheme or levy exists), so it has no flag.
-  x$flag <- if_else(x$non_significant == "Y" & !x$component %in% c("subsidy", "tax"),
+  # The flag N means "a value exists, but it is too small to estimate, so 0".
+  # PRD_BP gets N when PRD_PP has N: it contains that production value.
+  x$flag <- if_else((x$non_significant     == "Y" & x$component %in% c("value", "basic")) |
+                    (x$non_significant_sub == "Y" & x$component == "subsidy") |
+                    (x$non_significant_tax == "Y" & x$component == "tax"),
                     "N", NA_character_)
 
   # Items that are not sent at previous-year prices keep their row, with NA.
